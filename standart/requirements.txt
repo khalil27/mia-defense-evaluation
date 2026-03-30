@@ -1,0 +1,7 @@
+numpy
+pandas
+scikit-learn
+tensorflow==2.12.0
+torch
+transformers
+nbformat
