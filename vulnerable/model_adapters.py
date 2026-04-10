@@ -5,14 +5,16 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 class VulnerableMLPKerasLike:
-    def __init__(self, input_dim, hidden1=256, hidden2=128):
+    def __init__(self, input_dim, hidden1=1024, hidden2=512):
         self.device = torch.device("cpu")
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden1),
             nn.ReLU(),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden2, 1),
+            nn.Linear(hidden2, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
         ).to(self.device)
         self.lr = 1e-3
 
