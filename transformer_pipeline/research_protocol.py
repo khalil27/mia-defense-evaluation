@@ -7,7 +7,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -46,6 +46,13 @@ def mia_features_enriched(proba: np.ndarray, y_true: np.ndarray) -> np.ndarray:
 
 
 def attack_row(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray) -> Dict[str, float]:
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+
+    def tpr_at_fpr(target_fpr: float) -> float:
+        idx = np.searchsorted(fpr, target_fpr, side="right") - 1
+        idx = int(np.clip(idx, 0, len(tpr) - 1))
+        return float(tpr[idx])
+
     return {
         "attack": name,
         "auc": float(roc_auc_score(y_true, y_score)),
@@ -53,6 +60,8 @@ def attack_row(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_score: np.nd
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "tpr_at_1pct_fpr": tpr_at_fpr(0.01),
+        "tpr_at_5pct_fpr": tpr_at_fpr(0.05),
     }
 
 
@@ -64,6 +73,7 @@ def _fit_shadow_meta_classifier(
     n_shadows: int,
     shadow_epochs: int,
     shadow_batch_size: int,
+    shadow_member_fraction: float = 0.5,
     postprocess_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> GradientBoostingClassifier:
     post_fn = postprocess_fn if postprocess_fn is not None else (lambda p: p)
@@ -71,11 +81,13 @@ def _fit_shadow_meta_classifier(
     shadow_x_all: List[np.ndarray] = []
     shadow_y_all: List[np.ndarray] = []
 
+    member_fraction = float(np.clip(shadow_member_fraction, 0.1, 0.9))
+
     for i in range(n_shadows):
         xs_mem, xs_non, ys_mem, ys_non = train_test_split(
             X_shadow_raw,
             y_shadow,
-            test_size=0.5,
+            test_size=1.0 - member_fraction,
             random_state=seed + 100 + i,
             stratify=y_shadow,
         )
@@ -105,9 +117,9 @@ def _fit_shadow_meta_classifier(
     y_meta = np.concatenate(shadow_y_all)
 
     meta = GradientBoostingClassifier(
-        n_estimators=250,
+        n_estimators=350,
         learning_rate=0.05,
-        max_depth=3,
+        max_depth=4,
         random_state=seed,
     )
     meta.fit(X_meta, y_meta)
@@ -127,7 +139,10 @@ def evaluate_mia_research_protocol(
     n_shadows: int = 10,
     shadow_epochs: int = 35,
     shadow_batch_size: int = 16,
+    shadow_member_fraction: float = 0.5,
     postprocess_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    optimize_low_fpr_threshold: bool = False,
+    max_fpr_target: float = 0.05,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     post_fn = postprocess_fn if postprocess_fn is not None else (lambda p: p)
 
@@ -146,10 +161,20 @@ def evaluate_mia_research_protocol(
         n_shadows=n_shadows,
         shadow_epochs=shadow_epochs,
         shadow_batch_size=shadow_batch_size,
+        shadow_member_fraction=shadow_member_fraction,
         postprocess_fn=post_fn,
     )
 
     rows = []
+
+    def threshold_for_low_fpr(y_true: np.ndarray, y_score: np.ndarray, fpr_limit: float) -> float:
+        fpr, tpr, thr = roc_curve(y_true, y_score)
+        valid = np.where(fpr <= float(fpr_limit))[0]
+        if len(valid) == 0:
+            return float(np.max(y_score) + 1e-6)
+        best_idx = valid[np.argmax(tpr[valid])]
+        return float(thr[best_idx])
+
     for seed in seed_list:
         Xb_tr, Xb_te, Xe_tr, Xe_te, ya_tr, ya_te = train_test_split(
             X_basic,
@@ -178,18 +203,28 @@ def evaluate_mia_research_protocol(
 
         lr = LogisticRegression(max_iter=1000, random_state=seed)
         lr.fit(Xb_tr, ya_tr)
+        lr_score_tr = lr.predict_proba(Xb_tr)[:, 1]
         lr_score = lr.predict_proba(Xb_te)[:, 1]
-        lr_pred = (lr_score >= 0.5).astype(int)
+        if optimize_low_fpr_threshold:
+            lr_thr = threshold_for_low_fpr(ya_tr, lr_score_tr, max_fpr_target)
+        else:
+            lr_thr = 0.5
+        lr_pred = (lr_score >= lr_thr).astype(int)
         rows.append({"seed": seed, **attack_row("logistic", ya_te, lr_pred, lr_score)})
 
+        sh_score_tr = meta.predict_proba(Xe_tr)[:, 1]
         sh_score = meta.predict_proba(Xe_te)[:, 1]
-        sh_pred = (sh_score >= 0.5).astype(int)
+        if optimize_low_fpr_threshold:
+            sh_thr = threshold_for_low_fpr(ya_tr, sh_score_tr, max_fpr_target)
+        else:
+            sh_thr = 0.5
+        sh_pred = (sh_score >= sh_thr).astype(int)
         rows.append({"seed": seed, **attack_row("shadow_meta", ya_te, sh_pred, sh_score)})
 
     per_seed = pd.DataFrame(rows)
 
     summary = (
-        per_seed.groupby("attack")[["auc", "accuracy", "precision", "recall", "f1"]]
+        per_seed.groupby("attack")[["auc", "accuracy", "precision", "recall", "f1", "tpr_at_1pct_fpr", "tpr_at_5pct_fpr"]]
         .agg(["mean", "std"])
         .reset_index()
     )
@@ -205,6 +240,10 @@ def evaluate_mia_research_protocol(
         "recall_std",
         "f1_mean",
         "f1_std",
+        "tpr_at_1pct_fpr_mean",
+        "tpr_at_1pct_fpr_std",
+        "tpr_at_5pct_fpr_mean",
+        "tpr_at_5pct_fpr_std",
     ]
     summary = summary.sort_values("auc_mean", ascending=False)
 
